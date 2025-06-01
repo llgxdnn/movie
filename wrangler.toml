@@ -1,0 +1,2 @@
+name = "影视在线观看"
+main = "index.html"  # 指定正确的入口路径
