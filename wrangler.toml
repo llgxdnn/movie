@@ -1,2 +1,2 @@
 name = "movie-online"
-main = "index.html"  # 指定正确的入口路径
+main = "js/app.js"  # 指定正确的入口路径
