@@ -13,6 +13,42 @@ const TOAST_BG_COLORS = {
 };
 const HISTORY_MAX_ITEMS = 50;           // 观看历史最大数量
 
+/**
+ * 实际切换设置面板的函数
+ */
+function actuallyToggleSettingsPanel() {
+    togglePanel('settingsPanel', 'historyPanel');
+}
+
+/**
+ * 设置面板开关 - 增加了密码验证逻辑
+ * @param {Event} e 事件对象
+ */
+// js/ui.js
+
+function toggleSettings(e) {
+    e?.stopPropagation();
+
+    const settingsPasswordHash = window.__ENV__?.SETTINGS_PASSWORD;
+    const isProtected = settingsPasswordHash && settingsPasswordHash.length === 64 && !/^0+$/.test(settingsPasswordHash);
+
+    if (isProtected && typeof isSettingsPasswordVerified === 'function' && !isSettingsPasswordVerified()) {
+        window.verifyingPurpose = 'settings';
+        const modal = getElement('passwordModal');
+        const title = getElement('passwordModalTitle');
+        const p = modal?.querySelector('p');
+
+        if (title) title.textContent = "设置项验证";
+        if (p) p.textContent = "请输入密码以访问设置";
+
+        if (typeof showPasswordModal === 'function') {
+            showPasswordModal();
+        }
+    } else {
+        // 如果没有设置密码，或者已经验证通过，直接打开
+        actuallyToggleSettingsPanel();
+    }
+}
 
 /**
  * 生成「剧 + 集」唯一标识  
@@ -102,15 +138,6 @@ function togglePanel(panelIdToShow, panelIdToHide, onShowCallback) {
 // =============== UI相关函数 =============================
 
 /**
- * 设置面板开关
- * @param {Event} e 事件对象
- */
-function toggleSettings(e) {
-    e?.stopPropagation();
-    togglePanel('settingsPanel', 'historyPanel');
-}
-
-/**
  * 历史面板开关
  * @param {Event} e 事件对象
  */
@@ -196,28 +223,26 @@ let lastFocusedElement = null;
  * @param {string} content 模态框内容
  * @param {string} title 模态框标题（可选）
  */
-function showModal(content, title = '') {
+function showModal(contentNode, title = '') {
     const modal = getElement('modal');
     const modalContent = getElement('modalContent');
     const modalTitle = getElement('modalTitle');
 
     if (!modal || !modalContent) return;
 
-    // 保存当前焦点元素，以便关闭时恢复
     lastFocusedElement = document.activeElement;
 
-    // 设置内容
-    modalContent.innerHTML = content;
+    // 关键修复：从 .innerHTML 赋值改为 .appendChild
+    modalContent.innerHTML = ''; // 先清空旧内容
+    modalContent.appendChild(contentNode); // 直接附加带有事件监听的DOM节点
+
     if (modalTitle && title) modalTitle.textContent = title;
 
-    // 显示模态框
     modal.classList.remove('hidden');
     modal.setAttribute('aria-hidden', 'false');
 
-    // 设置焦点陷阱
     setupFocusTrap(modal);
 
-    // 将焦点移至模态框内的第一个可聚焦元素
     const focusableElements = modal.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])');
     if (focusableElements.length) {
         focusableElements[0].focus();
@@ -350,7 +375,6 @@ function handleSearchTagClick(e) {
         return;
     }
 }
-
 
 /**
  * 渲染搜索历史标签
@@ -491,8 +515,9 @@ function handleHistoryListClick(e) {
     if (deleteButton) {
         e.stopPropagation();
         const historyItem = deleteButton.closest('.history-item');
-        if (historyItem && historyItem.dataset.url) {
-            deleteHistoryItem(encodeURIComponent(historyItem.dataset.url));
+        // Use the correct dataset attribute
+        if (historyItem && historyItem.dataset.internalId) {
+            deleteHistoryItem(historyItem.dataset.internalId); // Use internalId
         }
         return;
     }
@@ -504,7 +529,8 @@ function handleHistoryListClick(e) {
         const title = historyItem.dataset.title;
         const episodeIndex = parseInt(historyItem.dataset.episodeIndex, 10);
         const playbackPosition = parseInt(historyItem.dataset.playbackPosition, 10);
-        playFromHistory(url, title, episodeIndex, playbackPosition);
+        const typeName = historyItem.dataset.typeName;
+        playFromHistory(url, title, episodeIndex, playbackPosition, typeName);
     }
 }
 
@@ -524,15 +550,25 @@ function formatPlaybackTime(seconds) {
  * @param {Object} videoInfo 视频信息对象
  */
 function addToViewingHistory(videoInfo) {
-
     if (!checkPasswordProtection()) return;
+    const originalEpisodeNames = JSON.parse(localStorage.getItem('originalEpisodeNames') || '[]');
+
     try {
         let history = getViewingHistory();
 
         // 使用统一工具生成「剧 + 集」级唯一键，避免同名不同集互相覆盖
         const internalShowIdentifier = getUniqueEpisodeId(videoInfo);
 
-        const idx = history.findIndex(item => item.internalShowIdentifier === internalShowIdentifier);
+        // 先用内部标识精确查重
+        let idx = history.findIndex(item => item.internalShowIdentifier === internalShowIdentifier);
+        // 如未找到，再用「标题+源+集」做一次宽松查重（兼容旧纪录缺 vod_id/year）
+        if (idx === -1) {
+            idx = history.findIndex(item =>
+                item.title === videoInfo.title &&
+                item.sourceCode === videoInfo.sourceCode &&
+                item.episodeIndex === videoInfo.episodeIndex
+            );
+        }
 
         if (idx !== -1) { // 如果这部剧已在历史中
             const item = history[idx];
@@ -542,19 +578,27 @@ function addToViewingHistory(videoInfo) {
             item.playbackPosition = videoInfo.playbackPosition;
             item.duration = videoInfo.duration;
             item.timestamp = Date.now();
-            // 如果新的videoInfo提供了更完整的剧集列表，则更新
+            item.year = videoInfo.year || item.year;
+
             if (videoInfo.episodes && videoInfo.episodes.length > 0) {
-                // 简单的检查，如果长度不同或第一个元素不同，就认为需要更新（可以做得更复杂）
                 if (!item.episodes || item.episodes.length !== videoInfo.episodes.length || (item.episodes[0] !== videoInfo.episodes[0])) {
                     item.episodes = [...videoInfo.episodes];
                 }
             }
-            // 其他信息如 title, sourceName, sourceCode, vod_id, internalShowIdentifier 应该保持不变
             item.sourceName = videoInfo.sourceName || item.sourceName; // 保留旧的，除非新的明确提供
 
             history.splice(idx, 1); // 移除旧条目
             history.unshift(item);  // 将更新后的条目移到最前面
-        } else { // 如果是新的剧集条目
+            // 更新原始剧集名称
+            if (videoInfo.originalEpisodeNames) {
+                item.originalEpisodeNames = videoInfo.originalEpisodeNames;
+            } else if (originalEpisodeNames.length > 0) {
+                item.originalEpisodeNames = originalEpisodeNames;
+            }
+        } else {
+            // 如果是新的剧集条目
+            const originalEpisodeNames = AppState.get('originalEpisodeNames') ||
+                JSON.parse(localStorage.getItem('originalEpisodeNames') || '[]');
             const newItem = {
                 title: videoInfo.title,
                 url: videoInfo.url,
@@ -565,13 +609,16 @@ function addToViewingHistory(videoInfo) {
                 internalShowIdentifier: internalShowIdentifier, // 保存这个内部标识符
                 playbackPosition: videoInfo.playbackPosition,
                 duration: videoInfo.duration,
+                year: videoInfo.year,
                 timestamp: Date.now(),
-                episodes: (videoInfo.episodes && videoInfo.episodes.length > 0) ? [...videoInfo.episodes] : []
+                episodes: (videoInfo.episodes && videoInfo.episodes.length > 0) ? [...videoInfo.episodes] : [],
+                originalEpisodeNames: originalEpisodeNames,
+                typeName: videoInfo.typeName || (window.currentVideoTypeName || '')
             };
             history.unshift(newItem);
         }
 
-        if (history.length > HISTORY_MAX_ITEMS) { // HISTORY_MAX_ITEMS 在 ui.js 定义 [cite: 1059]
+        if (history.length > HISTORY_MAX_ITEMS) {
             history.splice(HISTORY_MAX_ITEMS);
         }
         localStorage.setItem('viewingHistory', JSON.stringify(history));
@@ -614,14 +661,33 @@ function loadViewingHistory() {
         // 防XSS
         const safeTitle = (item.title || '').replace(/[<>"']/g, c => ({ '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
         const safeSource = (item.sourceName || '未知来源').replace(/[<>"']/g, c => ({ '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-        const episodeText = item.episodeIndex !== undefined ? `第${item.episodeIndex + 1}集` : '';
-
+        let episodeText = '';
+        if (item.episodeIndex !== undefined) {
+            // 优先使用保存的原始剧集名称
+            if (item.originalEpisodeNames && item.originalEpisodeNames.length > item.episodeIndex) {
+                episodeText = item.originalEpisodeNames[item.episodeIndex];
+            } else {
+                // 兼容旧记录
+                if (item.episodes && item.episodes[item.episodeIndex]) {
+                    const episodeString = item.episodes[item.episodeIndex];
+                    if (typeof episodeString === 'string' && episodeString.includes('$')) {
+                        episodeText = episodeString.split('$')[0].trim();
+                    }
+                }
+            }
+            // 如果还是没有，则显示"第X集"
+            if (!episodeText) {
+                episodeText = `第${item.episodeIndex + 1}集`;
+            }
+        }
         const historyItem = document.createElement('div');
         historyItem.className = 'history-item cursor-pointer relative group';
         historyItem.dataset.url = item.url;
         historyItem.dataset.title = safeTitle;
         historyItem.dataset.episodeIndex = item.episodeIndex || 0;
         historyItem.dataset.playbackPosition = item.playbackPosition || 0;
+        historyItem.dataset.internalId = item.internalShowIdentifier;
+        historyItem.dataset.typeName = item.typeName || '';
 
         // 构建历史项内容
         const historyInfo = document.createElement('div');
@@ -685,7 +751,7 @@ function loadViewingHistory() {
 
         // 删除按钮
         const deleteButton = document.createElement('button');
-        deleteButton.className = 'history-item-delete-btn absolute right-2 top-2 opacity-0 group-hover:opacity-100 transition-opacity duration-200 text-gray-400 hover:text-red-400 p-1 rounded-full hover:bg-gray-800 z-10';
+        deleteButton.className = 'history-item-delete-btn absolute right-2 top-2 transition-opacity duration-200 text-gray-400 hover:text-red-400 p-1 rounded-full hover:bg-gray-800 z-10';
         deleteButton.title = '删除记录';
         deleteButton.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path>
@@ -698,8 +764,6 @@ function loadViewingHistory() {
     historyList.innerHTML = '';
     historyList.appendChild(frag);
     if (history.length > 5) historyList.classList.add('pb-4');
-
-    // 移除旧的事件监听器和添加新的事件委托的代码已移至attachEventListeners函数
 }
 
 /**
@@ -711,6 +775,9 @@ function attachEventListeners() {
     if (settingsButton) {
         settingsButton.addEventListener('click', toggleSettings);
     }
+
+    // 新增：监听设置密码验证成功的事件
+    document.addEventListener('settingsPasswordVerified', actuallyToggleSettingsPanel);
 
     // 观看历史按钮
     const historyButton = getElement('historyButton');
@@ -742,7 +809,6 @@ function attachEventListeners() {
         closeModalButton.addEventListener('click', closeModal);
     }
 
-    // 优化：将委托事件监听器移到这里一次性设置
     // 搜索历史标签点击事件委托
     const recentSearches = getElement('recentSearches');
     if (recentSearches) {
@@ -763,9 +829,6 @@ function attachEventListeners() {
  * 初始化其他可能的事件监听器
  */
 function initializeAdditionalListeners() {
-    // API选择按钮 - 保留单独的事件监听器
-    // 注: 由于这些按钮数量有限且不会动态变化，使用单独的事件监听器更直接清晰
-    // 如果未来这些按钮会动态增减，可考虑改为事件委托模式
     const apiSelectButtons = document.querySelectorAll('[data-action="selectAllAPIs"]');
     if (apiSelectButtons.length > 0) {
         const apiSelectHandler = function () {
@@ -806,7 +869,6 @@ window.toggleSettings = toggleSettings;
 window.toggleHistory = toggleHistory;
 window.addToViewingHistory = addToViewingHistory;
 window.clearViewingHistory = clearViewingHistory;
-// window.playFromHistory = playFromHistory;
 window.saveSearchHistory = saveSearchHistory;
 window.clearSearchHistory = clearSearchHistory;
 window.renderSearchHistory = renderSearchHistory;
@@ -850,3 +912,26 @@ function setupPanelAutoClose() {
 document.addEventListener('DOMContentLoaded', function () {
     setupPanelAutoClose();
 });
+
+/**
+ * 删除单条观看历史
+ * @param {string} internalId 要删除的记录的 internalShowIdentifier
+ */
+function deleteHistoryItem(internalId) {
+    try {
+        let history = getViewingHistory();
+        // 使用 internalShowIdentifier 来确保删除正确的条目
+        const updatedHistory = history.filter(item => item.internalShowIdentifier !== internalId);
+
+        if (history.length !== updatedHistory.length) {
+            localStorage.setItem('viewingHistory', JSON.stringify(updatedHistory));
+            loadViewingHistory(); // 重新渲染历史记录列表
+            showToast('已删除该条记录', 'success');
+        } else {
+            showToast('未找到要删除的记录', 'warning');
+        }
+    } catch (e) {
+        console.error('删除观看历史失败:', e);
+        showToast('删除历史记录失败', 'error');
+    }
+}
