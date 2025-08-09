@@ -206,8 +206,66 @@ function initCustomRightControls() {
     if (window.customRightControlsInitialized) return;
     window.customRightControlsInitialized = true;
 
-    // 绑定网页全屏按钮点击事件
     const webFullscreenBtn = document.getElementById('web-fullscreen-control-btn');
+    const isMobile = () => ('ontouchstart' in window) || (navigator.maxTouchPoints > 0) || /Mobi|Android/i.test(navigator.userAgent);
+
+    if (isMobile() && webFullscreenBtn) {
+        webFullscreenBtn.style.display = 'none'; // 在移动端默认隐藏
+
+        let longPressTimer;
+        let touchStartX;
+        let touchStartY;
+
+        const playerRegion = document.getElementById('player-region');
+
+        if (playerRegion) {
+            const handleTouchStart = (e) => {
+                if (e.touches.length === 1) { // 仅处理单指触摸
+                    const touch = e.touches[0];
+                    touchStartX = touch.clientX;
+                    touchStartY = touch.clientY;
+
+                    // 如果触摸点在已经显示的按钮上，则不启动计时器，允许用户直接点击
+                    if (webFullscreenBtn.contains(e.target)) {
+                        clearTimeout(longPressTimer);
+                        return;
+                    }
+
+                    longPressTimer = setTimeout(() => {
+                        webFullscreenBtn.style.display = 'block'; // 长按后显示按钮
+
+                        // 3秒后自动隐藏
+                        setTimeout(() => {
+                            if (webFullscreenBtn) {
+                                webFullscreenBtn.style.display = 'none';
+                            }
+                        }, 3000);
+                    }, 500); // 500毫秒定义为长按
+                }
+            };
+
+            const handleTouchMove = (e) => {
+                if (e.touches.length === 1) {
+                    const touch = e.touches[0];
+                    // 如果手指移动超过10像素，则取消长按计时器
+                    if (Math.abs(touch.clientX - touchStartX) > 10 || Math.abs(touch.clientY - touchStartY) > 10) {
+                        clearTimeout(longPressTimer);
+                    }
+                }
+            };
+
+            const handleTouchEnd = () => {
+                clearTimeout(longPressTimer);
+            };
+
+            playerRegion.addEventListener('touchstart', handleTouchStart);
+            playerRegion.addEventListener('touchmove', handleTouchMove);
+            playerRegion.addEventListener('touchend', handleTouchEnd);
+            playerRegion.addEventListener('touchcancel', handleTouchEnd); // 处理触摸取消事件
+        }
+    }
+
+    // 绑定网页全屏按钮点击事件
     if (webFullscreenBtn) {
         webFullscreenBtn.addEventListener('click', (e) => {
             e.preventDefault();
@@ -493,6 +551,7 @@ async function processVideoUrl(url) {
 async function initPlayer(videoUrl, title) {
     // 直接获取在 HTML 中声明好的播放器元素
     player = document.getElementById('player');
+    window.player = player;
 
     if (!player) {
         showError("播放器元素 (#player) 未在HTML中找到");
@@ -600,6 +659,9 @@ async function playEpisode(index) {
     }
     universalId = generateUniversalId(currentVideoTitle, currentVideoYear, index);
 
+    // 保存原始索引（用于预加载计算）
+    const originalIndex = window.currentEpisodeIndex;
+
     if (player && player.currentTime > 5) {
         saveVideoSpecificProgress();
     }
@@ -632,10 +694,11 @@ async function playEpisode(index) {
         nextSeekPosition = 0;
     }
 
-    doEpisodeSwitch(index, currentEpisodes[index]);
+    // 传递原始索引到 doEpisodeSwitch
+    doEpisodeSwitch(index, currentEpisodes[index], originalIndex);
 }
 
-async function doEpisodeSwitch(index, episodeString) {
+async function doEpisodeSwitch(index, episodeString, originalIndex) {
     let playUrl = episodeString;
     if (episodeString && episodeString.includes('$')) {
         playUrl = episodeString.split('$')[1];
@@ -662,9 +725,26 @@ async function doEpisodeSwitch(index, episodeString) {
     if (player) {
         const processedUrl = await processVideoUrl(playUrl);
         player.src = { src: processedUrl, type: 'application/x-mpegurl' };
+        // 在调用预加载前添加状态检查
+        if (typeof preloadNextEpisodeParts === 'function') {
+            // 取消之前的预加载
+            if (typeof window.cancelCurrentPreload === 'function') {
+                window.cancelCurrentPreload();
+            }
+            // 延迟触发预加载，确保状态同步
+            setTimeout(() => {
+                const preloadEnabled = localStorage.getItem('preloadEnabled') !== 'false';
+                if (preloadEnabled && typeof preloadNextEpisodeParts === 'function') {
+                    preloadNextEpisodeParts(index).catch(e => {
+                        console.error('Preload error:', e);
+                    });
+                }
+            }, 500);
+        }
         player.play().catch(e => console.warn("Autoplay after episode switch was prevented.", e));
     }
 }
+
 
 (async function initializePage() {
     // 从localStorage加载最新的custom API配置
@@ -735,6 +815,11 @@ async function doEpisodeSwitch(index, episodeString) {
         window.currentEpisodeIndex = currentEpisodeIndex;
 
         setupAllUI();
+
+        // 初始化搜索和历史功能
+        if (typeof initPlayerSearchHistory === 'function') {
+            initPlayerSearchHistory();
+        }
 
         const positionFromUrl = urlParams.get('position');
         if (positionFromUrl) {
@@ -846,7 +931,22 @@ function updateBrowserHistory(newEpisodeUrl) {
 
 function setupPlayerControls() {
     const backButton = document.getElementById('back-button');
-    if (backButton) backButton.addEventListener('click', () => { window.location.href = 'index.html'; });
+    if (backButton) {
+        backButton.addEventListener('click', () => {
+            const playerSearchPerformed = sessionStorage.getItem('playerSearchPerformed');
+
+            if (playerSearchPerformed === 'true') {
+                // 清除播放页搜索状态
+                sessionStorage.removeItem('playerSearchPerformed');
+                sessionStorage.removeItem('playerSearchQuery');
+
+                // 回到首页并尝试恢复搜索状态
+                window.location.href = 'index.html?restore_search=true';
+            } else {
+                window.location.href = 'index.html';
+            }
+        });
+    }
 
 
 
@@ -1480,9 +1580,28 @@ async function switchLine(newSourceCode, newVodId) {
         const timeToSeek = player.currentTime;
 
         vodIdForPlayer = newVodId;
+        // 更新剧集列表（变量、全局、localStorage）
         currentEpisodes = newEps;
         window.currentEpisodes = newEps;
         localStorage.setItem('currentEpisodes', JSON.stringify(newEps));
+        if (window.preloadedEpisodeUrls) window.preloadedEpisodeUrls.clear();
+        if (window.inFlightEpisodeUrls) window.inFlightEpisodeUrls.clear();
+
+        // 清空本页已缓存的预加载地址
+        if (window.preloadedEpisodeUrls) {
+            window.preloadedEpisodeUrls.clear();
+        }
+        // 重置预加载状态
+        if (typeof window.cancelCurrentPreload === 'function') {
+            window.cancelCurrentPreload();
+        }
+        // 重新初始化预加载（如果启用）
+        const preloadEnabled = localStorage.getItem('preloadEnabled') !== 'false';
+        if (preloadEnabled && typeof startPreloading === 'function') {
+            setTimeout(() => {
+                startPreloading();
+            }, 300);
+        }
 
         currentVideoTitle = targetSourceItem.vod_name;
         currentVideoYear = targetSourceItem.vod_year;
@@ -1640,43 +1759,47 @@ function setupPlaySettingsEvents() {
 
         adFilterToggle.addEventListener('change', async function (event) {
             adFilteringEnabled = event.target.checked;
-
             // 更新localStorage（保持与首页同步）
             localStorage.setItem('adFilteringEnabled', adFilteringEnabled.toString());
-
             // 更新URL中的af参数，以便刷新或分享时保留设置
             const url = new URL(window.location);
             url.searchParams.set('af', adFilteringEnabled ? '1' : '0');
             window.history.replaceState({}, '', url);
-
             showToast(adFilteringEnabled ? '已开启分片广告过滤' : '已关闭分片广告过滤', 'info');
-
-            // 重新加载播放器以应用设置
+            // 关键步骤：重新加载播放器以应用设置
             if (player) {
                 const originalUrl = new URLSearchParams(window.location.search).get('url');
                 if (!originalUrl) return;
-
-                // 先记下当前位置
-                const resumeAt = player.currentTime || 0;
-
-                // 先挂监听器，再换 src，保证一定能收到 loadedmetadata
-                if (resumeAt > 0) {
-                    const restore = () => {
-                        player.currentTime = resumeAt;
-                        player.removeEventListener('loadedmetadata', restore);
-                    };
-                    player.addEventListener('loadedmetadata', restore);
-                }
+                const resumeAt = player.currentTime || 0;   // 记下当前位置
+                // 预设置下次定位位置（用于播放器内部状态同步）
+                nextSeekPosition = resumeAt;
 
                 const processedUrl = await processVideoUrl(originalUrl);
-
                 // 清理旧 blob URL（如有）
                 if (player.currentSrc && player.currentSrc.startsWith('blob:')) {
                     URL.revokeObjectURL(player.currentSrc);
                 }
 
+                // 定义恢复函数（优先使用loadedmetadata确保定位准确）
+                function restorePosition() {
+                    if (resumeAt > 0 && player.duration > resumeAt) {
+                        player.currentTime = resumeAt;
+                    }
+                    player.removeEventListener('loadedmetadata', restorePosition);
+                }
+
+                // 只使用loadedmetadata事件确保在元数据加载完成后定位
+                player.addEventListener('loadedmetadata', restorePosition, { once: true });
+
+                // 真正换源
                 player.src = { src: processedUrl, type: 'application/x-mpegurl' };
-                player.play().catch(e => console.warn('重新加载播放失败:', e));
+
+                // 播放时直接从指定位置开始
+                player.play().then(() => {
+                    if (resumeAt > 0) {
+                        player.currentTime = resumeAt;
+                    }
+                }).catch(e => console.warn('重新加载播放失败:', e));
             }
         });
 
@@ -1686,38 +1809,50 @@ function setupPlaySettingsEvents() {
     // 设置预加载开关
     const preloadToggle = document.getElementById('preloadToggle');
     if (preloadToggle && !preloadToggle.hasAttribute('data-initialized')) {
-        const preloadEnabled = localStorage.getItem('preloadingEnabled') !== 'false';
-        preloadToggle.checked = preloadEnabled;
+        // 修正：直接使用 PLAYER_CONFIG 中的值
+        preloadToggle.checked = PLAYER_CONFIG.enablePreloading;
 
         // 添加事件监听器以响应变化
         preloadToggle.addEventListener('change', function () {
             localStorage.setItem('preloadingEnabled', this.checked.toString());
+            // 更新 PLAYER_CONFIG 中的值
+            PLAYER_CONFIG.enablePreloading = this.checked;
             showToast(this.checked ? '预加载已开启' : '预加载已关闭', 'info');
+            // 触发预加载逻辑（新增：开关变化时立即生效）
+            if (this.checked) {
+                startPreloading();
+            } else {
+                stopPreloading();
+            }
         });
-
         preloadToggle.setAttribute('data-initialized', 'true');
     }
 
     // 设置自定义预加载集数
     const preloadEpisodeCountInput = document.getElementById('preloadEpisodeCount');
     if (preloadEpisodeCountInput && !preloadEpisodeCountInput.hasAttribute('data-initialized')) {
-        const preloadEpisodeCount = localStorage.getItem('preloadCount') || '3';
-        preloadEpisodeCountInput.value = preloadEpisodeCount;
+        // 修正：直接使用 PLAYER_CONFIG 中的值
+        preloadEpisodeCountInput.value = PLAYER_CONFIG.preloadCount;
 
         // 添加事件监听器以响应变化
         preloadEpisodeCountInput.addEventListener('change', function () {
             const count = parseInt(this.value, 10);
-            // 验证输入值是否为有效的正数
-            if (count > 0) {
-                localStorage.setItem('preloadCount', count.toString());
+            // 验证输入值是否为有效的正数（限制1-10集，与首页逻辑一致）
+            if (count >= 1 && count <= 10) {
+                localStorage.setItem('preloadEpisodeCount', count.toString());
+                // 更新 PLAYER_CONFIG 中的值
+                PLAYER_CONFIG.preloadCount = count;
                 showToast(`预加载集数已设置为 ${count}`, 'info');
+                // 触发预加载逻辑（新增：集数变化时立即生效）
+                if (localStorage.getItem('preloadingEnabled') !== 'false') {
+                    startPreloading();
+                }
             } else {
                 // 如果输入无效，则恢复之前的值
-                this.value = localStorage.getItem('preloadCount') || '3';
-                showToast('请输入有效的预加载集数（正整数）', 'error');
+                this.value = PLAYER_CONFIG.preloadCount;
+                showToast('请输入1-10之间的有效数字', 'error');
             }
         });
-
         preloadEpisodeCountInput.setAttribute('data-initialized', 'true');
     }
 }

@@ -454,7 +454,14 @@ document.addEventListener('DOMContentLoaded', function () {
     APISourceManager.init();
     initializeEventListeners();
     renderSearchHistory();
-    restoreSearchFromCache();
+
+    // 检查是否需要恢复搜索状态
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get('restore_search') === 'true') {
+        restoreSearchStateFromPlayer();
+    } else {
+        restoreSearchFromCache();
+    }
 });
 
 function initializeAppState() {
@@ -485,6 +492,64 @@ function initializeAppState() {
     } catch (e) {
         console.error('从 sessionStorage 恢复视频元数据缓存失败:', e);
         AppState.set('videoDataMap', new Map());
+    }
+}
+
+/**
+ * 从播放页返回时恢复搜索状态
+ */
+function restoreSearchStateFromPlayer() {
+    try {
+        // 尝试从sessionStorage恢复搜索状态
+        const searchQuery = sessionStorage.getItem('searchQuery');
+        const searchResults = sessionStorage.getItem('searchResults');
+        const selectedAPIs = sessionStorage.getItem('selectedAPIs');
+
+        if (searchQuery && searchResults) {
+            // 恢复搜索框内容
+            const searchInput = DOMCache.get('searchInput');
+            if (searchInput) {
+                searchInput.value = searchQuery;
+            }
+
+            // 恢复API选择状态
+            if (selectedAPIs) {
+                try {
+                    const apis = JSON.parse(selectedAPIs);
+                    AppState.set('selectedAPIs', apis);
+                    localStorage.setItem('selectedAPIs', selectedAPIs);
+                } catch (e) {
+                    console.error('恢复API选择状态失败:', e);
+                }
+            }
+
+            // 恢复搜索结果
+            try {
+                const results = JSON.parse(searchResults);
+                if (Array.isArray(results) && results.length > 0) {
+                    renderSearchResults(results);
+                    if (typeof showToast === 'function') {
+                        showToast(`已恢复搜索结果: "${searchQuery}"`, 'info', 3000);
+                    }
+                }
+            } catch (e) {
+                console.error('恢复搜索结果失败:', e);
+                // 如果恢复失败，重新执行搜索
+                if (typeof performSearch === 'function') {
+                    performSearch(searchQuery, AppState.get('selectedAPIs'));
+                }
+            }
+        }
+
+        // 清理URL参数
+        const url = new URL(window.location);
+        url.searchParams.delete('restore_search');
+        window.history.replaceState({}, document.title, url.toString());
+
+    } catch (error) {
+        console.error('恢复搜索状态失败:', error);
+        // 降级到普通的缓存恢复
+        restoreSearchFromCache();
     }
 }
 
@@ -547,35 +612,33 @@ function initializeEventListeners() {
     }
     const preloadingToggle = DOMCache.get('preloadingToggle');
     if (preloadingToggle) {
+        // 直接使用 PLAYER_CONFIG 中的值
+        preloadingToggle.checked = PLAYER_CONFIG.enablePreloading;
+
         preloadingToggle.addEventListener('change', (e) => {
             const enabled = e.target.checked;
             localStorage.setItem('preloadingEnabled', enabled.toString());
+            // 更新 PLAYER_CONFIG 中的值
             PLAYER_CONFIG.enablePreloading = enabled;
             showToast(enabled ? '已启用预加载' : '已禁用预加载', 'info');
-            const preloadCountInput = DOMCache.get('preloadCountInput');
-            if (preloadCountInput) preloadCountInput.disabled = !enabled;
         });
-        const preloadingEnabled = getBoolConfig('preloadingEnabled', true);
-        preloadingToggle.checked = preloadingEnabled;
-        PLAYER_CONFIG.enablePreloading = preloadingEnabled;
-        const preloadCountInput = DOMCache.get('preloadCountInput');
-        if (preloadCountInput) preloadCountInput.disabled = !preloadingEnabled;
     }
+
     const preloadCountInput = DOMCache.get('preloadCountInput');
     if (preloadCountInput) {
+        // 直接使用 PLAYER_CONFIG 中的值
+        preloadCountInput.value = PLAYER_CONFIG.preloadCount;
+
         preloadCountInput.addEventListener('change', (e) => {
             let count = parseInt(e.target.value);
             if (isNaN(count) || count < 1) count = 1;
             else if (count > 10) count = 10;
             e.target.value = count;
             localStorage.setItem('preloadCount', count.toString());
+            // 更新 PLAYER_CONFIG 中的值
             PLAYER_CONFIG.preloadCount = count;
             showToast(`预加载数量已设置为 ${count}`, 'info');
         });
-        const savedCount = localStorage.getItem('preloadCount');
-        const preloadCount = savedCount ? parseInt(savedCount) : 2;
-        preloadCountInput.value = preloadCount;
-        PLAYER_CONFIG.preloadCount = preloadCount;
     }
 }
 
@@ -618,6 +681,18 @@ function search(options = {}) {
     performSearch(query, selectedAPIs)
         .then(resultsData => {
             renderSearchResults(resultsData, options.doubanQuery ? query : null);
+
+            // 保存搜索状态到sessionStorage，供播放页返回时恢复
+            if (!options.doubanQuery) {
+                try {
+                    sessionStorage.setItem('searchQuery', query);
+                    sessionStorage.setItem('searchResults', JSON.stringify(resultsData));
+                    sessionStorage.setItem('selectedAPIs', JSON.stringify(selectedAPIs));
+                } catch (e) {
+                    console.error('保存搜索状态失败:', e);
+                }
+            }
+
             // 缓存结果已加载，无需额外提示
         })
         .catch(error => {
@@ -972,6 +1047,22 @@ function renderSearchResults(allResults, doubanSearchedTitle = null) {
     });
     gridContainer.appendChild(fragment);
     searchResultsContainer.appendChild(gridContainer);
+    // 在渲染结果后同步预加载状态
+    if (typeof window.startPreloading !== 'undefined' && typeof window.stopPreloading !== 'undefined') {
+        const preloadEnabled = localStorage.getItem('preloadEnabled') !== 'false';
+        if (preloadEnabled) {
+            // 确保预加载在搜索结果页面正确初始化
+            setTimeout(() => {
+                if (typeof window.startPreloading === 'function') {
+                    window.startPreloading();
+                }
+            }, 100);
+        } else {
+            if (typeof window.stopPreloading === 'function') {
+                window.stopPreloading();
+            }
+        }
+    }
     const searchArea = getElement('searchArea');
     if (searchArea) {
         searchArea.classList.remove('flex-1');
